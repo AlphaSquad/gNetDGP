@@ -1,6 +1,7 @@
 import click
 
 from source.DiseaseNet import DiseaseNet
+from source.PhenoNet import PhenoNet
 from source.GeneNet import GeneNet
 from source.gNetDGPModel import gNetDGPModel
 
@@ -13,29 +14,29 @@ def cli():
 @click.command()
 @click.option('--fc_hidden_dim', default=3000)
 @click.option('--gene_net_hidden_dim', default=830)
-@click.option('--disease_net_hidden_dim', default=500)
+@click.option('--pheno_net_hidden_dim', default=500)
 @click.option('--folds', default=5)
 @click.option('--max_epochs', default=500)
 @click.option('--early_stopping_window', default=20)
 @click.option('--lr', default=0.00004, help='Learning rate')
 @click.option('--weight_decay', default=0.15)
 @click.option('--gene_dataset_root', default='./data/gene_net')
-@click.option('--disease_dataset_root', default='./data/disease_net')
-@click.option('--training_data_path', default='./data/training/genes_diseases.tsv')
+@click.option('--pheno_dataset_root', default='./data/pheno_net')
+@click.option('--training_data_path', default='./data/training/gene_phenotype_training.tsv')
 @click.option('--model_tmp_storage', default='/tmp')
 @click.option('--results_storage', default='./out')
 @click.option('--experiment_slug', default='train_generic')
 def generic_train(
         fc_hidden_dim,
         gene_net_hidden_dim,
-        disease_net_hidden_dim,
+        pheno_net_hidden_dim,
         folds,
         max_epochs,
         early_stopping_window,
         lr,
         weight_decay,
         gene_dataset_root,
-        disease_dataset_root,
+        pheno_dataset_root,
         training_data_path,
         model_tmp_storage,
         results_storage,
@@ -55,7 +56,7 @@ def generic_train(
     from sklearn.metrics import roc_curve, auc
     from sklearn.model_selection import KFold, train_test_split
 
-    print('Load the gene and disease graphs.')
+    print('Load the gene and pheno graphs.')
     gene_dataset = GeneNet(
         root=gene_dataset_root,
         humannet_version='FN',
@@ -63,45 +64,43 @@ def generic_train(
         skip_truncated_svd=True
     )
 
-    disease_dataset = DiseaseNet(
-        root=disease_dataset_root,
-        hpo_count_freq_cutoff=40,
-        edge_source='feature_similarity',
-        feature_source=['disease_publications'],
-        skip_truncated_svd=True,
-        svd_components=2048,
-        svd_n_iter=12
+    pheno_dataset = PhenoNet(
+        root=pheno_dataset_root,
+        #edge_source='feature_similarity',
+        edge_source='',
+        #feature_source=['disease_publications'],
+        feature_source='diseases',
     )
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     gene_net_data = gene_dataset[0]
-    disease_net_data = disease_dataset[0]
+    pheno_net_data = pheno_dataset[0]
     gene_net_data = gene_net_data.to(device)
-    disease_net_data = disease_net_data.to(device)
+    pheno_net_data = pheno_net_data.to(device)
 
     print('Generate training data.')
-    disease_genes = pd.read_table(
+    pheno_genes = pd.read_table(
         training_data_path,
-        names=['EntrezGene ID', 'OMIM ID'],
+        names=['EntrezGene ID', 'HPO ID'],
         sep='\t',
         low_memory=False,
         dtype={'EntrezGene ID': pd.Int64Dtype()}
     )
 
-    disease_id_index_feature_mapping = disease_dataset.load_disease_index_feature_mapping()
+    pheno_id_index_feature_mapping = pheno_dataset.load_pheno_index_feature_mapping()
     gene_id_index_feature_mapping = gene_dataset.load_node_index_mapping()
 
     all_genes = list(gene_id_index_feature_mapping.keys())
-    all_diseases = list(disease_id_index_feature_mapping.keys())
+    all_phenos = list(pheno_id_index_feature_mapping.keys())
 
     # 1. generate positive pairs.
     # Filter the pairs to only include the ones where the corresponding nodes are available.
     # i.e. gene_id should be in all_genes and disease_id should be in all_diseases.
-    positives = disease_genes[
-        disease_genes["OMIM ID"].isin(all_diseases) & disease_genes["EntrezGene ID"].isin(all_genes)
+    positives = pheno_genes[
+        pheno_genes["HPO ID"].isin(all_phenos) & pheno_genes["EntrezGene ID"].isin(all_genes)
         ]
-    covered_diseases = list(set(positives['OMIM ID']))
+    print(positives)
+    covered_phenos = list(set(positives['HPO ID']))
     covered_genes = list(set(positives['EntrezGene ID']))
 
     # 2. Generate negatives.
@@ -109,30 +108,26 @@ def generic_train(
     negatives_list = []
     while len(negatives_list) < len(positives):
         gene_id = all_genes[np.random.randint(0, len(all_genes))]
-        disease_id = covered_diseases[np.random.randint(0, len(covered_diseases))]
-        if not ((positives['OMIM ID'] == disease_id) & (positives['EntrezGene ID'] == gene_id)).any():
-            negatives_list.append([disease_id, gene_id])
-    negatives = pd.DataFrame(np.array(negatives_list), columns=['OMIM ID', 'EntrezGene ID'])
+        pheno_id = covered_phenos[np.random.randint(0, len(covered_phenos))]
+        if not ((positives['HPO ID'] == pheno_id) & (positives['EntrezGene ID'] == gene_id)).any():
+            negatives_list.append([pheno_id, gene_id])
+    negatives = pd.DataFrame(np.array(negatives_list), columns=['HPO ID', 'EntrezGene ID'])
 
-    def get_training_data_from_indexes(indexes, monogenetic_disease_only=False, multigenetic_diseases_only=False):
+    def get_training_data_from_indexes(indexes):
         train_tuples = set()
         for idx in indexes:
-            pos = positives[positives['OMIM ID'] == covered_diseases[idx]]
-            neg = negatives[negatives['OMIM ID'] == covered_diseases[idx]]
-            if monogenetic_disease_only and len(pos) != 1:
-                continue
-            if multigenetic_diseases_only and len(pos) == 1:
-                continue
+            pos = positives[positives['HPO ID'] == covered_phenos[idx]]
+            neg = negatives[negatives['HPO ID'] == covered_phenos[idx]]
             for index, row in pos.iterrows():
-                train_tuples.add((row['OMIM ID'], row['EntrezGene ID'], 1))
+                train_tuples.add((row['HPO ID'], row['EntrezGene ID'], 1))
             for index, row in neg.iterrows():
-                train_tuples.add((row['OMIM ID'], row['EntrezGene ID'], 0))
+                train_tuples.add((row['HPO ID'], row['EntrezGene ID'], 0))
         ## 2. Concat data.
         n = len(train_tuples)
         x_out = np.ones((n, 2))  # will contain (gene_idx, disease_idx) tuples.
         y_out = torch.ones((n,), dtype=torch.long)
-        for i, (omim_id, gene_id, y) in enumerate(train_tuples):
-            x_out[i] = (gene_id_index_feature_mapping[int(gene_id)], disease_id_index_feature_mapping[omim_id])
+        for i, (hpo_id, gene_id, y) in enumerate(train_tuples):
+            x_out[i] = (gene_id_index_feature_mapping[int(gene_id)], pheno_id_index_feature_mapping[hpo_id])
             y_out[i] = y
         return x_out, y_out
 
@@ -145,7 +140,7 @@ def generic_train(
             weight_decay=5e-4,
             fc_hidden_dim=2048,
             gene_net_hidden_dim=512,
-            disease_net_hidden_dim=512
+            pheno_net_hidden_dim=512
     ):
         criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([0.2, 0.8]).to(device))
         metrics = []
@@ -153,7 +148,7 @@ def generic_train(
         fold = 0
         start_time = time.time()
         kf = KFold(n_splits=folds, shuffle=True, random_state=42)
-        for train_index, test_index in kf.split(covered_diseases):
+        for train_index, test_index in kf.split(covered_phenos):
             fold += 1
             print(f'Generate training data for fold {fold}.')
             all_train_x, all_train_y = get_training_data_from_indexes(train_index)
@@ -170,19 +165,16 @@ def generic_train(
             print(f'Generate test data for fold {fold}.')
             test_x = dict()
             test_y = dict()
-            test_x['mono'], test_y['mono'] = get_training_data_from_indexes(test_index, monogenetic_disease_only=True)
+            test_x['mono'], test_y['mono'] = get_training_data_from_indexes(test_index)
             test_y['mono'] = test_y['mono'].to(device)
-            test_x['multi'], test_y['multi'] = get_training_data_from_indexes(test_index,
-                                                                              multigenetic_diseases_only=True)
-            test_y['multi'] = test_y['multi'].to(device)
 
             # Create the model
             model = gNetDGPModel(
                 gene_feature_dim=gene_net_data.x.shape[1],
-                disease_feature_dim=disease_net_data.x.shape[1],
+                pheno_feature_dim=pheno_net_data.x.shape[1],
                 fc_hidden_dim=fc_hidden_dim,
                 gene_net_hidden_dim=gene_net_hidden_dim,
-                disease_net_hidden_dim=disease_net_hidden_dim,
+                pheno_net_hidden_dim=pheno_net_hidden_dim,
                 mode='DGP'
             ).to(device)
             optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -197,18 +189,13 @@ def generic_train(
                 'TPR': None,
                 'FPR': None
             }
-            losses['multi'] = {
-                'AUC': 0,
-                'TPR': None,
-                'FPR': None
-            }
 
             best_val_loss = 1e80
             for epoch in range(max_epochs):
                 # Train model.
                 model.train()
                 optimizer.zero_grad()
-                out = model(gene_net_data, disease_net_data, train_x)
+                out = model(gene_net_data, pheno_net_data, train_x)
                 loss = criterion(out, train_y)
                 loss.backward()
                 optimizer.step()
@@ -217,7 +204,7 @@ def generic_train(
                 # Validation.
                 with torch.no_grad():
                     model.eval()
-                    out = model(gene_net_data, disease_net_data, val_x)
+                    out = model(gene_net_data, pheno_net_data, val_x)
                     loss = criterion(out, val_y)
                     current_val_loss = loss.item()
                     losses['val'].append(current_val_loss)
@@ -246,9 +233,9 @@ def generic_train(
                 torch.load(osp.join(model_tmp_storage, f'best_model_fold_{fold}.ptm'), map_location=device)
             )
             with torch.no_grad():
-                for modus in ['multi', 'mono']:
+                for modus in ['mono']:
                     predicted_probs = F.log_softmax(
-                        model(gene_net_data, disease_net_data, test_x[modus]).clone().detach(), dim=1
+                        model(gene_net_data, pheno_net_data, test_x[modus]).clone().detach(), dim=1
                     )
                     true_y = test_y[modus]
                     fpr, tpr, _ = roc_curve(true_y.cpu().detach().numpy(), predicted_probs[:, 1].cpu().detach().numpy(),
@@ -278,16 +265,16 @@ def generic_train(
         rank_vec_cum = np.array(rank_vec_cum)
         return rank_vec_cum
 
-    disease_idx_to_omim_mapping = dict()
-    for omim_id, disease_idx in disease_id_index_feature_mapping.items():
-        disease_idx_to_omim_mapping[disease_idx] = omim_id
+    pheno_idx_to_hpo_mapping = dict()
+    for hpo_id, pheno_idx in pheno_id_index_feature_mapping.items():
+        pheno_idx_to_hpo_mapping[pheno_idx] = hpo_id
 
     gene_idx_entrez_id_mapping = dict()
     for entrez_id, gene_idx in gene_id_index_feature_mapping.items():
         gene_idx_entrez_id_mapping[gene_idx] = entrez_id
 
-    def get_genes_assoc_to_omim_disease(omim_id):
-        return positives[positives["OMIM ID"].isin([omim_id])]["EntrezGene ID"].values
+    def get_genes_assoc_to_omim_disease(hpo_id):
+        return positives[positives["HPO ID"].isin([hpo_id])]["EntrezGene ID"].values
 
     # Reproducibility
     np.random.seed(42)
@@ -302,7 +289,7 @@ def generic_train(
         weight_decay=weight_decay,
         fc_hidden_dim=fc_hidden_dim,
         gene_net_hidden_dim=gene_net_hidden_dim,
-        disease_net_hidden_dim=disease_net_hidden_dim
+        pheno_net_hidden_dim=pheno_net_hidden_dim
     )
 
     # Store the results.
@@ -317,25 +304,25 @@ def generic_train(
 @click.command()
 @click.option('--fc_hidden_dim', default=3000)
 @click.option('--gene_net_hidden_dim', default=830)
-@click.option('--disease_net_hidden_dim', default=500)
+@click.option('--pheno_net_hidden_dim', default=500) # can probably be much lower for phenos
 @click.option('--gene_dataset_root', default='./data/gene_net')
-@click.option('--disease_dataset_root', default='./data/disease_net')
+@click.option('--pheno_dataset_root', default='./data/pheno_net')
 @click.option('--model_path', default='./model/generic_pre_trained_model_fold_1.ptm')
 @click.option('--out_file', default='./generic_predict_results.tsv')
 @click.option('--get_available_genes', is_flag=True, help='List available genes and exit')
-@click.option('--get_available_diseases', is_flag=True, help='List available diseases and exit')
+@click.option('--get_available_phenos', is_flag=True, help='List available phenos and exit')
 @click.option('--sort_result_by_score', default=True, help='Sort the result by predicted score. (Default is True)')
 @click.argument('input_file')
 def generic_predict(
         fc_hidden_dim,
         gene_net_hidden_dim,
-        disease_net_hidden_dim,
+        pheno_net_hidden_dim,
         gene_dataset_root,
-        disease_dataset_root,
+        pheno_dataset_root,
         model_path,
         out_file,
         get_available_genes,
-        get_available_diseases,
+        get_available_phenos,
         sort_result_by_score,
         input_file
 ):
@@ -357,24 +344,20 @@ def generic_predict(
         skip_truncated_svd=True
     )
 
-    disease_dataset = DiseaseNet(
-        root=disease_dataset_root,
-        hpo_count_freq_cutoff=40,
-        edge_source='feature_similarity',
-        feature_source=['disease_publications'],
-        skip_truncated_svd=True,
-        svd_components=2048,
-        svd_n_iter=12
+    pheno_dataset = PhenoNet(
+        root=pheno_dataset_root,
+        edge_source='',
+        feature_source='diseases',
     )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     gene_net_data = gene_dataset[0]
-    disease_net_data = disease_dataset[0]
+    pheno_net_data = pheno_dataset[0]
     gene_net_data = gene_net_data.to(device)
-    disease_net_data = disease_net_data.to(device)
+    pheno_net_data = pheno_net_data.to(device)
 
-    disease_id_index_feature_mapping = disease_dataset.load_disease_index_feature_mapping()
+    pheno_id_index_feature_mapping = pheno_dataset.load_pheno_index_feature_mapping()
     gene_id_index_feature_mapping = gene_dataset.load_node_index_mapping()
 
     if get_available_genes:
@@ -383,36 +366,36 @@ def generic_predict(
         for gene in all_genes:
             print(gene)
         return
-    if get_available_diseases:
-        all_diseases = list(disease_id_index_feature_mapping.keys())
-        print('Available diseases:')
-        for disease in all_diseases:
-            print(disease)
+    if get_available_phenos:
+        all_phenos = list(pheno_id_index_feature_mapping.keys())
+        print('Available phenos:')
+        for pheno in all_phenos:
+            print(pheno)
         return
 
     model = gNetDGPModel(
         gene_feature_dim=gene_net_data.x.shape[1],
-        disease_feature_dim=disease_net_data.x.shape[1],
+        pheno_feature_dim=pheno_net_data.x.shape[1],
         fc_hidden_dim=fc_hidden_dim,
         gene_net_hidden_dim=gene_net_hidden_dim,
-        disease_net_hidden_dim=disease_net_hidden_dim,
+        pheno_net_hidden_dim=pheno_net_hidden_dim,
         mode='DGP'
     ).to(device)
 
     model.load_state_dict(torch.load(model_path, map_location=device))
 
     # Create input vector
-    input_tuples = pd.read_csv(input_file, comment='#', sep='\t', header=None, names=['Gene ID', 'Omim Id'])
+    input_tuples = pd.read_csv(input_file, comment='#', sep='\t', header=None, names=['Gene ID', 'HPO ID'])
     n = len(input_tuples)
-    x_in = np.ones((n, 2))  # will contain (gene_idx, disease_idx) tuples.
+    x_in = np.ones((n, 2))  # will contain (gene_idx, pheno_idx) tuples.
     for i, row in input_tuples.iterrows():
-        x_in[i] = (gene_id_index_feature_mapping[int(row[0])], disease_id_index_feature_mapping[row[1]])
+        x_in[i] = (gene_id_index_feature_mapping[int(row[0])], pheno_id_index_feature_mapping[row[1]])
 
     print('Predict')
     model.eval()
     with torch.no_grad():
         predicted_probs = F.softmax(
-            model(gene_net_data, disease_net_data, x_in).clone().detach(), dim=1
+            model(gene_net_data, pheno_net_data, x_in).clone().detach(), dim=1
         )[:, -1:]
     input_tuples['Score'] = predicted_probs.numpy()
 
@@ -427,14 +410,14 @@ def generic_predict(
 @click.command()
 @click.option('--fc_hidden_dim', default=3000)
 @click.option('--gene_net_hidden_dim', default=830)
-@click.option('--disease_net_hidden_dim', default=500)
+@click.option('--pheno_net_hidden_dim', default=500)
 @click.option('--folds', default=5)
 @click.option('--max_epochs', default=500)
 @click.option('--early_stopping_window', default=20)
 @click.option('--lr_classification', default=0.00000347821, help='Learning rate')
 @click.option('--weight_decay_classification', default=0.5165618)
 @click.option('--gene_dataset_root', default='./data/gene_net')
-@click.option('--disease_dataset_root', default='./data/disease_net')
+@click.option('--pheno_dataset_root', default='./data/pheno_net')
 @click.option('--training_disease_genes_path', default='./data/training/genes_diseases.tsv')
 @click.option('--training_disease_class_assignments_path', default='./data/training/extracted_disease_class_assignments.tsv')
 @click.option('--model_tmp_storage', default='/tmp')
